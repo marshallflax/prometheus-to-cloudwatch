@@ -13,6 +13,7 @@ import (
 	"mime"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -129,12 +130,16 @@ type Bridge struct {
 	includeDimensionsForMetrics   []MatcherWithStringSet
 	excludeDimensionsForMetrics   []MatcherWithStringSet
 	forceHighRes                  bool
+
+	// CloudWatch expects the *difference* between the current value of a counter and the
+	// value it had the last time a datapoint was reported to it
+	previousValues map[string]float64
 }
 
 // NewBridge initializes and returns a pointer to a Bridge using the
 // supplied configuration, or an error if there is a problem with the configuration
 func NewBridge(c *Config) (*Bridge, error) {
-	b := &Bridge{}
+	b := &Bridge{previousValues: make(map[string]float64)}
 
 	if c.CloudWatchNamespace == "" {
 		return nil, errors.New("CloudWatchNamespace required")
@@ -205,14 +210,17 @@ func (b *Bridge) Run(ctx context.Context) {
 		case <-ticker.C:
 			mfChan := make(chan *dto.MetricFamily, 1024)
 
+			metricTypes := make(map[string]dto.MetricType)
+
 			go fetchMetricFamilies(b.prometheusScrapeUrl, mfChan, b.prometheusCertPath, b.prometheusKeyPath, b.prometheusSkipServerCertCheck)
 
 			var metricFamilies []*dto.MetricFamily
 			for mf := range mfChan {
 				metricFamilies = append(metricFamilies, mf)
+				metricTypes[mf.GetName()] = mf.GetType()
 			}
 
-			count, err := b.publishMetricsToCloudWatch(metricFamilies)
+			count, err := b.publishMetricsToCloudWatch(metricFamilies, metricTypes)
 			if err != nil {
 				log.Println("prometheus-to-cloudwatch: error publishing to CloudWatch:", err)
 			}
@@ -227,10 +235,10 @@ func (b *Bridge) Run(ctx context.Context) {
 }
 
 // NOTE: The CloudWatch API has the following limitations:
-//  - Max 40kb request size
-//	- Single namespace per request
-//	- Max 10 dimensions per metric
-func (b *Bridge) publishMetricsToCloudWatch(mfs []*dto.MetricFamily) (count int, e error) {
+//   - Max 40kb request size
+//   - Single namespace per request
+//   - Max 10 dimensions per metric
+func (b *Bridge) publishMetricsToCloudWatch(mfs []*dto.MetricFamily, metricTypes map[string]dto.MetricType) (count int, e error) {
 	vec, err := expfmt.ExtractSamples(&expfmt.DecodeOptions{Timestamp: model.Now()}, mfs...)
 
 	if err != nil {
@@ -239,12 +247,40 @@ func (b *Bridge) publishMetricsToCloudWatch(mfs []*dto.MetricFamily) (count int,
 
 	data := make([]*cloudwatch.MetricDatum, 0, batchSize)
 
+	cutsuffixes := func(n string) (string, bool) {
+		if withoutBucket, ok := strings.CutSuffix(n, "_bucket"); ok {
+			return withoutBucket, true
+		}
+		if withoutSum, ok := strings.CutSuffix(n, "_sum"); ok {
+			return withoutSum, true
+		}
+		if withoutCount, ok := strings.CutSuffix(n, "_count"); ok {
+			return withoutCount, true
+		}
+		return "", false
+	}
+
 	for _, s := range vec {
 		name := getName(s.Metric)
 		if b.shouldIgnoreMetric(name) {
 			continue
 		}
-		data = appendDatum(data, name, s, b)
+
+		metricType, ok := metricTypes[name]
+		if !ok {
+			withoutSuffix, ok := cutsuffixes(name)
+			if !ok {
+				log.Println(name, "missing metricType, no suffix")
+				continue
+			}
+			metricType, ok = metricTypes[withoutSuffix]
+			if !ok {
+				log.Println(name, "missing metricType, post suffix removal")
+				continue
+			}
+		}
+
+		data = appendDatum(data, name, s, b, metricType)
 
 		if len(data) == batchSize {
 			count += batchSize
@@ -312,7 +348,7 @@ func anyPatternMatches(patterns []glob.Glob, s string) bool {
 	return false
 }
 
-func appendDatum(data []*cloudwatch.MetricDatum, name string, s *model.Sample, b *Bridge) []*cloudwatch.MetricDatum {
+func appendDatum(data []*cloudwatch.MetricDatum, name string, s *model.Sample, b *Bridge, metricType dto.MetricType) []*cloudwatch.MetricDatum {
 	metric := s.Metric
 
 	if len(metric) == 0 {
@@ -323,6 +359,24 @@ func appendDatum(data []*cloudwatch.MetricDatum, name string, s *model.Sample, b
 	value := float64(s.Value)
 	if !validValue(value) {
 		return data
+	}
+
+	switch metricType {
+	case dto.MetricType_COUNTER, dto.MetricType_SUMMARY:
+		key := metric.Fingerprint().String()
+
+		prior, ok := b.previousValues[key]
+		b.previousValues[key] = value
+		if ok {
+			if value >= prior {
+				value = value - prior
+			} else {
+				log.Println(name, value, "vs", prior, "nonmonotonic")
+				return data
+			}
+		}
+	case dto.MetricType_GAUGE_HISTOGRAM, dto.MetricType_HISTOGRAM, dto.MetricType_UNTYPED:
+		return data // Don't send histograms or untyped to CloudWatch since they don't accept such metrics
 	}
 
 	datum := &cloudwatch.MetricDatum{}
